@@ -1,0 +1,18 @@
+# PyTorch backbone for TIDES (UEA classification + Physiome-ODE forecasting).
+torch>=2.4
+numpy>=1.26
+scipy>=1.13
+pandas>=2.2
+
+# Hyperparameter search and bookkeeping.
+optuna>=3.6
+pyyaml>=6.0
+tqdm>=4.66
+wandb>=0.17
+
+# UEA dataset loading and signature features (RFormer baselines).
+aeon>=1.0
+iisignature>=0.24
+sktime>=0.30
+scikit-learn>=1.5
+
