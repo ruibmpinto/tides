@@ -18,15 +18,24 @@ Importing this package exposes:
 from . import (
     EthanolConcentration,
     EigenWorms,
+    EigenWorms_mamba,
+    EigenWorms_mamba2,
+    EigenWorms_mamba3,
     Heartbeat,
     MotorImagery,
     SelfRegulationSCP1,
     SelfRegulationSCP2,
 )
 
+# Baseline grids are registered as "<dataset>:<model>". The unsuffixed key
+# stays the TIDES grid, so existing callers are unaffected; hypersearch
+# builds the suffixed key when --model names a Mamba variant.
 _MODULES = {
     "TSC_EthanolConcentration": EthanolConcentration,
     "TSC_EigenWorms":           EigenWorms,
+    "TSC_EigenWorms:mamba":     EigenWorms_mamba,
+    "TSC_EigenWorms:mamba2":    EigenWorms_mamba2,
+    "TSC_EigenWorms:mamba3":    EigenWorms_mamba3,
     "TSC_Heartbeat":            Heartbeat,
     "TSC_MotorImagery":         MotorImagery,
     "TSC_SelfRegulationSCP1":   SelfRegulationSCP1,

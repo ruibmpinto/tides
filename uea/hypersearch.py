@@ -53,7 +53,9 @@ DATASET_EARLY_STOP   = _sg.EARLY_STOPPING_MAP
 DATASET_N_STARTUP    = _sg.N_STARTUP_TRIALS_MAP
 
 CSV_COLUMNS = [
-    "trial", "dataset", "seed",
+    "trial", "dataset", "seed", "model",
+    "d_state", "headdim", "mimo_mode", "rope_fraction",
+    "d_conv", "expand", "resolved", "n_params",
     "lr", "weight_decay",
     "hidden_dim", "num_layers", "s5_init_blocks", "ssm_dim_multiplier", "ssm_size",
     "discretisation", "drop_rate", "learn_lambda",
@@ -94,10 +96,120 @@ def suggest_from_grid(trial: optuna.Trial, grid: dict) -> dict:
 def append_result(results_file, row):
     file_exists = os.path.isfile(results_file)
     with open(results_file, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS,
+                                extrasaction="ignore")
         if not file_exists:
             writer.writeheader()
         writer.writerow(row)
+
+
+
+# ---------------------------------------------------------------------------
+# Baseline objective (Mamba-1/2/3)
+# ---------------------------------------------------------------------------
+
+def _mamba_objective(trial, p, model, datasets, seeds, device,
+                     early_stop_patience, results_file, wandb_project,
+                     data_dir):
+    """Evaluate one baseline configuration; returns mean validation accuracy.
+
+    Separate from the TIDES objective because the two search spaces share
+    only the generic axes: TIDES has no headdim or MIMO rank, and the
+    baselines have no Lambda modes, bc_rank or discretisation.
+
+    add_time is True here. TIDES receives the step sizes through
+    step_scale, whereas the Mamba variants have no interface for elapsed
+    time, so the published EigenWorms Mamba configuration feeds it as an
+    extra input channel.
+    """
+    mamba_params = {k: v for k, v in p.items()}
+    val_metrics: list[float] = []
+
+    print(
+        f"\n--- {model} trial {trial.number} ---\n  "
+        + "  ".join(f"{k}={v}" for k, v in sorted(p.items()))
+    )
+
+    for dataset in datasets:
+        for s in seeds:
+            base_row = {
+                "trial": trial.number, "dataset": dataset, "seed": s,
+                "model": model,
+                "lr": p["lr"], "weight_decay": p["weight_decay"],
+                "hidden_dim": p["hidden_dim"],
+                "num_layers": p["num_layers"],
+                "d_state": p["d_state"], "drop_rate": p["drop_rate"],
+                "batch_size": p["batch_size"], "epoch": p["epoch"],
+                "headdim": p.get("headdim"),
+                "mimo_mode": p.get("mimo_mode"),
+                "rope_fraction": p.get("rope_fraction"),
+                "d_conv": p.get("d_conv"), "expand": p.get("expand"),
+            }
+
+            run = wandb.init(
+                project=wandb_project,
+                name=f"{model}_{dataset}_t{trial.number}_s{s}",
+                config={**base_row, "early_stop_patience": early_stop_patience},
+                tags=[dataset, model, "run"],
+                reinit=True,
+                settings=wandb.Settings(init_timeout=300),
+            )
+
+            try:
+                best_val, best_test, final_acc = train_trial(
+                    dataset=dataset,
+                    seed=s,
+                    device=device,
+                    model=model,
+                    mamba_params=mamba_params,
+                    add_time=True,
+                    data_dir=data_dir,
+                    lr=p["lr"],
+                    weight_decay=p["weight_decay"],
+                    epoch=int(p["epoch"]),
+                    early_stop_patience=early_stop_patience,
+                    batch_size=int(p["batch_size"]),
+                    use_random_drop=False,
+                    random_percentage=1.0,
+                )
+            except KeyboardInterrupt:
+                append_result(results_file, {**base_row, "status": "interrupted"})
+                wandb.finish(exit_code=1)
+                raise optuna.TrialPruned()
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+                label = "oom" if "out of memory" in err.lower() else "error"
+                print(f"    {label.upper()}:")
+                traceback.print_exc()
+                torch.cuda.empty_cache()
+                append_result(results_file, {**base_row, "status": label})
+                wandb.log({"status_code": 2})
+                wandb.finish()
+                raise optuna.TrialPruned()
+
+            val_metrics.append(best_val)
+            print(f"    -> val={best_val:.4f}  test@val={best_test:.4f}  "
+                  f"final={final_acc:.4f}")
+            append_result(results_file, {
+                **base_row,
+                "val_metric": best_val,
+                "best_test_metric": best_test,
+                "final_test_metric": final_acc,
+                "status": "ok",
+            })
+            wandb.log({"val_metric": best_val,
+                       "best_test_metric": best_test,
+                       "final_test_metric": final_acc,
+                       "status_code": 0})
+            wandb.finish()
+
+    if not val_metrics:
+        raise optuna.TrialPruned()
+
+    agg = float(np.mean(val_metrics))
+    trial.set_user_attr("val_metrics", val_metrics)
+    trial.set_user_attr("mean_val_metric", agg)
+    return agg
 
 
 # ---------------------------------------------------------------------------
@@ -105,16 +217,27 @@ def append_result(results_file, row):
 # ---------------------------------------------------------------------------
 
 def make_objective(datasets, device, early_stop_patience, seeds, results_file,
-                   wandb_project, use_random_drop, data_dir=None):
-    primary_grid = SEARCH_GRIDS[datasets[0]]
+                   wandb_project, use_random_drop, data_dir=None,
+                   model="tides"):
+    # Baseline grids are registered as "<dataset>:<model>"; the
+    # unsuffixed key remains the TIDES grid.
+    grid_key = datasets[0] if model == "tides" else f"{datasets[0]}:{model}"
+    primary_grid = SEARCH_GRIDS[grid_key]
     if len(datasets) > 1:
         for ds in datasets[1:]:
-            if SEARCH_GRIDS.get(ds) != primary_grid:
+            other = ds if model == "tides" else f"{ds}:{model}"
+            if SEARCH_GRIDS.get(other) != primary_grid:
                 print(f"  WARN: grid for {ds!r} differs from {datasets[0]!r}; "
                       f"using {datasets[0]!r}'s grid for the shared Optuna space.")
 
     def objective(trial: optuna.Trial) -> float:
         p = suggest_from_grid(trial, primary_grid)
+
+        if model != "tides":
+            return _mamba_objective(
+                trial, p, model, datasets, seeds, device,
+                early_stop_patience, results_file, wandb_project,
+                data_dir)
 
         lr                 = p["lr"]
         weight_decay       = p["weight_decay"]
@@ -283,14 +406,19 @@ def make_objective(datasets, device, early_stop_patience, seeds, results_file,
 def run_hypersearch(
     datasets, device, early_stop_patience, num_trials, num_seeds, results_file,
     seed, wandb_project, study_name, storage, use_random_drop,
-    n_startup_trials=None, data_dir=None,
+    n_startup_trials=None, data_dir=None, model="tides",
 ):
-    wandb.login(key="acb80b5313c2f79b59f413b1186edcb4749c9cae")
+    # Authenticate from the environment (WANDB_API_KEY) or ~/.netrc
+    # rather than a committed key.
+    wandb.login()
 
     seeds = REPO_SEEDS[:num_seeds]
 
     if n_startup_trials is None:
-        n_startup_trials = DATASET_N_STARTUP.get(datasets[0], num_trials // 3)
+        startup_key = (datasets[0] if model == "tides"
+                       else f"{datasets[0]}:{model}")
+        n_startup_trials = DATASET_N_STARTUP.get(startup_key,
+                                                 num_trials // 3)
 
     sampler = optuna.samplers.TPESampler(
         seed=seed, multivariate=True,
@@ -313,6 +441,7 @@ def run_hypersearch(
         wandb_project=wandb_project,
         use_random_drop=use_random_drop,
         data_dir=data_dir,
+        model=model,
     )
 
     print(f"Optuna study '{study_name}': {num_trials} trials, direction=maximize")
@@ -350,6 +479,10 @@ if __name__ == "__main__":
     )
     parser.add_argument("--datasets", nargs="+", default=["TSC_SelfRegulationSCP1"],
                         help="Dataset(s) to search over (must share the same grid)")
+    parser.add_argument("--model", default="tides",
+                        choices=["tides", "mamba", "mamba2", "mamba3"],
+                        help="Architecture to search. The Mamba variants "
+                             "use the '<dataset>:<model>' grids.")
     parser.add_argument("--data_dir", default="data_dir",
                         help="Root data directory (passed to get_dataset_preprocess)")
     parser.add_argument("--early_stop_patience", type=int, default=30,
@@ -393,4 +526,5 @@ if __name__ == "__main__":
         use_random_drop=not args.no_random_drop,
         n_startup_trials=args.n_startup_trials,
         data_dir=args.data_dir,
+        model=args.model,
     )

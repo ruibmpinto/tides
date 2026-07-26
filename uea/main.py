@@ -18,6 +18,7 @@ from lstm_classification import LSTM_Classification
 from utils import get_dataset_preprocess, get_dataset, ComputeModelParams
 from sig_utils import ComputeSignatures
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from tides import TIDESClassifier, step_scale_from_indices
 
@@ -231,6 +232,23 @@ def create_model(config, num_features, seq_len, num_samples, num_classes, device
             bidir=config.tides_bidir,
             proj_norm=config.tides_proj_norm if config.tides_proj_norm != "none" else None,
         ).to(device)
+    elif config.model in ("mamba", "mamba2", "mamba3"):
+        # Mamba-1/2/3 baselines, added to answer Reviewer 1's question
+        # about the newer variants. They share the block structure of the
+        # published Mamba/S6 EigenWorms baselines; see mamba_baselines.
+        from mamba_baselines.models import MambaVariantClassifier
+
+        params = getattr(config, "mamba_params", {}) or {}
+        return MambaVariantClassifier(
+            model_name=config.model,
+            input_dim=num_features,
+            num_layers=int(params["num_layers"]),
+            output_dim=num_classes,
+            hidden_dim=int(params["hidden_dim"]),
+            d_state=int(params["d_state"]),
+            drop_rate=float(params["drop_rate"]),
+            params=params,
+        ).to(device)
     else:
         raise ValueError(f"Unsupported model: {config.model}")
 
@@ -360,6 +378,9 @@ def train_trial(
     seed,
     device,
     *,
+    model="tides",
+    mamba_params=None,
+    add_time=False,
     data_dir=None,
     lr=1e-3,
     weight_decay=0.0,
@@ -388,12 +409,23 @@ def train_trial(
     clip_eigs=False,
     proj_norm="rmsnorm",
 ):
-    """Run one TIDES trial; returns (best_val_acc, best_test_at_val, final_acc)."""
+    """Run one trial; returns (best_val_acc, best_test_at_val, final_acc).
+
+    model selects the architecture: "tides" uses the TIDES-specific
+    keyword arguments below, while "mamba", "mamba2" and "mamba3" read
+    their hyperparameters from the mamba_params dict instead.
+
+    add_time appends a normalised time channel to the inputs. TIDES does
+    not need it, receiving the step sizes through step_scale, but the
+    Mamba variants have no interface for elapsed time, so the published
+    EigenWorms Mamba configuration supplies it as an extra channel.
+    """
     import types
     config = types.SimpleNamespace(
         dataset=dataset,
         data_dir=data_dir,
-        model="tides",
+        model=model,
+        mamba_params=mamba_params or {},
         epoch=epoch,
         early_stop_patience=early_stop_patience,
         batch_size=batch_size,
@@ -406,7 +438,7 @@ def train_trial(
         # signature / misc (unused for tides runs)
         use_signatures=False,
         online_signature_calc=False,
-        add_time=False,
+        add_time=add_time,
         univariate=False,
         global_backward=False,
         global_forward=False,
